@@ -23,8 +23,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 
 	"helm.sh/helm/v3/pkg/release"
@@ -35,7 +33,6 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli/values"
-	"helm.sh/helm/v3/pkg/releaseutil"
 )
 
 const templateDesc = `
@@ -54,13 +51,13 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	valueOpts := &values.Options{}
 	var kubeVersion string
 	var extraAPIs []string
-	var showFiles []string
+	var templateNames []string
 
 	cmd := &cobra.Command{
 		Use:   "template [NAME] [CHART]",
 		Short: "locally render templates",
 		Long:  templateDesc,
-		Args:  require.MinimumNArgs(1),
+		Args:  require.MaximumNArgs(2),
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			return compInstall(args, toComplete, client)
 		},
@@ -93,89 +90,92 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 				}
 				return err
 			}
+			if len(templateNames) > 0 {
 
-			// We ignore a potential error here because, when the --debug flag was specified,
-			// we always want to print the YAML, even if it is not valid. The error is still returned afterwards.
-			if rel != nil {
-				var manifests bytes.Buffer
-				fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
-				if !client.DisableHooks {
-					fileWritten := make(map[string]bool)
+				templatesToRender := make(map[string]bool)
+				for _, name := range templateNames {
+					templatesToRender[name] = true
+				}
+
+				rel, err := runInstall(args, client, valueOpts, out)
+				if err != nil && !settings.Debug {
+					return err
+				}
+				if rel != nil {
+					var manifests bytes.Buffer
+					fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
+
+					// Render templates from parent and subcharts
 					for _, m := range rel.Hooks {
 						if skipTests && isTestHook(m) {
 							continue
 						}
-						if client.OutputDir == "" {
+						templateName := filepath.Base(m.Path)
+						if templatesToRender[templateName] {
 							fmt.Fprintf(&manifests, "---\n# Source: %s\n%s\n", m.Path, m.Manifest)
-						} else {
-							newDir := client.OutputDir
-							if client.UseReleaseName {
-								newDir = filepath.Join(client.OutputDir, client.ReleaseName)
-							}
-							_, err := os.Stat(filepath.Join(newDir, m.Path))
-							if err == nil {
-								fileWritten[m.Path] = true
-							}
-
-							err = writeToFile(newDir, m.Path, m.Manifest, fileWritten[m.Path])
-							if err != nil {
-								return err
-							}
-						}
-
-					}
-				}
-
-				// if we have a list of files to render, then check that each of the
-				// provided files exists in the chart.
-				if len(showFiles) > 0 {
-					// This is necessary to ensure consistent manifest ordering when using --show-only
-					// with globs or directory names.
-					splitManifests := releaseutil.SplitManifests(manifests.String())
-					manifestsKeys := make([]string, 0, len(splitManifests))
-					for k := range splitManifests {
-						manifestsKeys = append(manifestsKeys, k)
-					}
-					sort.Sort(releaseutil.BySplitManifestsOrder(manifestsKeys))
-
-					manifestNameRegex := regexp.MustCompile("# Source: [^/]+/(.+)")
-					var manifestsToRender []string
-					for _, f := range showFiles {
-						missing := true
-						// Use linux-style filepath separators to unify user's input path
-						f = filepath.ToSlash(f)
-						for _, manifestKey := range manifestsKeys {
-							manifest := splitManifests[manifestKey]
-							submatch := manifestNameRegex.FindStringSubmatch(manifest)
-							if len(submatch) == 0 {
-								continue
-							}
-							manifestName := submatch[1]
-							// manifest.Name is rendered using linux-style filepath separators on Windows as
-							// well as macOS/linux.
-							manifestPathSplit := strings.Split(manifestName, "/")
-							// manifest.Path is connected using linux-style filepath separators on Windows as
-							// well as macOS/linux
-							manifestPath := strings.Join(manifestPathSplit, "/")
-
-							// if the filepath provided matches a manifest path in the
-							// chart, render that manifest
-							if matched, _ := filepath.Match(f, manifestPath); !matched {
-								continue
-							}
-							manifestsToRender = append(manifestsToRender, manifest)
-							missing = false
-						}
-						if missing {
-							return fmt.Errorf("could not find template %s in chart", f)
 						}
 					}
-					for _, m := range manifestsToRender {
-						fmt.Fprintf(out, "---\n%s\n", m)
+
+					for _, subchart := range rel.Chart.Metadata.Dependencies {
+						subchartPath := filepath.Join(rel.Chart.ChartPath(), "charts", subchart.Name)
+
+						// Run subchart install
+						subArgs := append(args[:1], subchartPath)
+						subArgs = append(subArgs, args[1:]...)
+						subRel, err := runInstall(subArgs, client, valueOpts, out)
+						if err != nil && !settings.Debug {
+							return err
+						}
+						if subRel != nil {
+							for _, m := range subRel.Hooks {
+								if skipTests && isTestHook(m) {
+									continue
+								}
+								templateName := filepath.Base(m.Path)
+								if templatesToRender[templateName] {
+									fmt.Fprintf(&manifests, "---\n# Source (Subchart %s): %s\n%s\n", subchart.Name, m.Path, m.Manifest)
+								}
+							}
+						}
 					}
-				} else {
+
 					fmt.Fprintf(out, "%s", manifests.String())
 				}
+			} else {
+
+				// We ignore a potential error here because, when the --debug flag was specified,
+				// we always want to print the YAML, even if it is not valid. The error is still returned afterwards.
+				if rel != nil {
+					var manifests bytes.Buffer
+					fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
+					if !client.DisableHooks {
+						fileWritten := make(map[string]bool)
+						for _, m := range rel.Hooks {
+							if skipTests && isTestHook(m) {
+								continue
+							}
+							if client.OutputDir == "" {
+								fmt.Fprintf(&manifests, "---\n# Source: %s\n%s\n", m.Path, m.Manifest)
+							} else {
+								newDir := client.OutputDir
+								if client.UseReleaseName {
+									newDir = filepath.Join(client.OutputDir, client.ReleaseName)
+								}
+								_, err := os.Stat(filepath.Join(newDir, m.Path))
+								if err == nil {
+									fileWritten[m.Path] = true
+								}
+
+								err = writeToFile(newDir, m.Path, m.Manifest, fileWritten[m.Path])
+								if err != nil {
+									return err
+								}
+							}
+
+						}
+					}
+				}
+
 			}
 
 			return err
@@ -184,7 +184,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 
 	f := cmd.Flags()
 	addInstallFlags(cmd, f, client, valueOpts)
-	f.StringArrayVarP(&showFiles, "show-only", "s", []string{}, "only show manifests rendered from the given templates")
+	f.StringArrayVarP(&templateNames, "template-names", "t", []string{}, "Names of the Templates to render")
 	f.StringVar(&client.OutputDir, "output-dir", "", "writes the executed templates to files in output-dir instead of stdout")
 	f.BoolVar(&validate, "validate", false, "validate your manifests against the Kubernetes cluster you are currently pointing at. This is the same validation performed on an install")
 	f.BoolVar(&includeCrds, "include-crds", false, "include CRDs in the templated output")
